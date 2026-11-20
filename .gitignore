@@ -1,0 +1,9 @@
+build/
+.gradle/
+*.jar
+.idea/
+*.iml
+out/
+.codepaw/
+CLAUDE.md
+!gradle/wrapper/gradle-wrapper.jar
