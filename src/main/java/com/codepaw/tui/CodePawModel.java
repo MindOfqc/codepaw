@@ -1455,3 +1455,160 @@ public class CodePawModel implements Model {
     // Sub-agent display
     // ────────────────────────────────────────────────────────────────────
 
+    private void handleSubAgentProgress(SubAgentProgress progress) {
+        subAgentProgressQueue.add(progress);
+        if (program != null) {
+            program.send(new AgentEventMessage());
+        }
+    }
+
+    private void drainSubAgentProgress() {
+        SubAgentProgress progress;
+        while ((progress = subAgentProgressQueue.poll()) != null) {
+            if (progress.done()) {
+                if (activeSubAgent != null) {
+                    activeSubAgent.done = true;
+                    activeSubAgent.toolCount = progress.toolCount();
+                    activeSubAgent.totalTime = progress.totalTime();
+                }
+            } else {
+                if (activeSubAgent == null || activeSubAgent.done) {
+                    activeSubAgent = new ChatMessage.SubAgentBlockState();
+                    activeSubAgent.desc = progress.description();
+                    activeSubAgent.agentType = progress.agentType();
+                }
+                if (progress.toolName() != null) {
+                    activeSubAgent.toolUses.add(new ChatMessage.ToolBlockInfo(
+                            progress.toolName(), Map.of(), progress.toolOutput(),
+                            progress.toolError(), 0, false, false));
+                }
+            }
+        }
+    }
+
+    private String renderSubAgentBlock(ChatMessage.SubAgentBlockState sab, boolean expanded) {
+        var sb = new StringBuilder();
+        String label = sab.agentType != null && !sab.agentType.isEmpty()
+                ? sab.agentType.substring(0, 1).toUpperCase() + sab.agentType.substring(1)
+                : "Agent";
+        sb.append(Styles.aiMarker.render("● %s(%s)".formatted(label, sab.desc)));
+        sb.append("\n");
+
+        if (sab.done) {
+            if (expanded) {
+                for (var tu : sab.toolUses) {
+                    String title = formatToolTitle(tu.toolName(),
+                            tu.args() != null ? tu.args() : Map.of());
+                    String line = "     %s (%.1fs)".formatted(title, tu.elapsed());
+                    sb.append(tu.isError()
+                            ? Styles.toolError.render(line)
+                            : Styles.toolDone.render(line));
+                    sb.append("\n");
+                }
+            } else {
+                sb.append(Styles.toolDone.render("  ⎿  Done (%d tool uses · %.1fs)".formatted(
+                        sab.toolCount, sab.totalTime)));
+                sb.append(Styles.toolDetail.render("  (ctrl+o to expand)"));
+                sb.append("\n");
+            }
+        } else {
+            int n = sab.toolUses.size();
+            if (n > 0) {
+                var last = sab.toolUses.get(n - 1);
+                sb.append(Styles.toolDone.render("  ⎿  %s".formatted(
+                        formatToolTitle(last.toolName(),
+                                last.args() != null ? last.args() : Map.of()))));
+                sb.append("\n");
+            }
+            if (n > 1) {
+                sb.append(Styles.toolDetail.render("     … +%d tool uses (ctrl+o to expand)".formatted(n - 1)));
+                sb.append("\n");
+            }
+            sb.append(Styles.toolDetail.render("     Running…"));
+            sb.append("\n");
+        }
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Teammate spinner tree
+    // ────────────────────────────────────────────────────────────────────
+
+    private String renderTeammateTree() {
+        var progressList = teamManager.getAllTeammateProgress();
+        if (progressList.isEmpty()) return "";
+
+        var sb = new StringBuilder();
+        sb.append("\n");
+        // Leader line
+        sb.append("  ┌─ ").append(Styles.cyan("team-lead"))
+          .append(": ").append(Styles.dim(thinkingVerb + "…"));
+        if (totalInput + totalOutput > 0) {
+            sb.append(Styles.dim(" · " + TeammateProgress.formatTokens(totalInput + totalOutput) + " tokens"));
+        }
+        sb.append("\n");
+
+        // Teammate lines
+        for (int i = 0; i < progressList.size(); i++) {
+            var p = progressList.get(i);
+            boolean isLast = (i == progressList.size() - 1);
+            String connector = isLast ? "  └─ " : "  ├─ ";
+
+            sb.append(connector).append(Styles.cyan("@" + p.getName())).append(": ");
+
+            switch (p.getStatus()) {
+                case "completed" -> sb.append(Styles.green("completed"));
+                case "failed" -> sb.append(Styles.red("failed"));
+                case "stopped" -> sb.append(Styles.yellow("stopped"));
+                case "idle" -> sb.append(Styles.dim("idle"));
+                default -> sb.append(Styles.dim(p.getActivitySummary() + "..."));
+            }
+
+            sb.append(Styles.dim(" · " + p.getToolUseCount() + " tools · "
+                    + TeammateProgress.formatTokens(p.getTokenCount()) + " tokens"));
+            sb.append("\n");
+        }
+
+        return sb.toString();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Plan approval
+    // ────────────────────────────────────────────────────────────────────
+
+    private UpdateResult<CodePawModel> handlePlanApprovalKey(KeyPressMessage kpm) {
+        var result = planApprovalDialog.handleKey(kpm.key());
+        if (result == null) return UpdateResult.from(this);
+
+        switch (result.type()) {
+            case YOLO -> {
+                if (permChecker != null) permChecker.setMode(PermissionMode.BYPASS);
+                chatMessages.add(new ChatMessage("system",
+                        "Plan approved. Entered YOLO mode (all operations auto-approved)."));
+                PlanFile.resetPlanPath();
+            }
+            case MANUAL -> {
+                if (permChecker != null) {
+                    var restoreMode = prePlanMode != null ? prePlanMode : PermissionMode.DEFAULT;
+                    permChecker.setMode(restoreMode);
+                }
+                chatMessages.add(new ChatMessage("system",
+                        "Plan approved. Each edit will require your confirmation."));
+                PlanFile.resetPlanPath();
+            }
+            case FEEDBACK -> {
+                String feedback = result.feedback();
+                inputBuffer.setLength(0);
+                inputBuffer.append(feedback);
+                return sendUserMessage();
+            }
+            case CANCEL -> {}
+        }
+        return UpdateResult.from(this);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Task notifications
+    // ────────────────────────────────────────────────────────────────────
+
