@@ -657,3 +657,425 @@ public class CodePawModel implements Model {
     // Chat
     // ────────────────────────────────────────────────────────────────────
 
+    private UpdateResult<CodePawModel> handleChatKey(KeyPressMessage kpm) {
+        String key = kpm.key();
+
+        // shift+tab: cycle permission mode
+        if (key.equals("shift+tab") && !streaming && permChecker != null) {
+            var current = permChecker.getMode();
+            var next = switch (current) {
+                case DEFAULT -> PermissionMode.ACCEPT_EDITS;
+                case ACCEPT_EDITS -> PermissionMode.PLAN;
+                case PLAN -> PermissionMode.BYPASS;
+                case BYPASS -> PermissionMode.DEFAULT;
+            };
+            permChecker.setMode(next);
+            // Status bar already shows the mode — no need for a chat message
+            return UpdateResult.from(this);
+        }
+
+        // ctrl+o: toggle tool block fold/unfold
+        if (key.equals("ctrl+o")) {
+            for (var msg : chatMessages) {
+                if ("tool_group".equals(msg.role) || "tool_collapsed".equals(msg.role)
+                        || "sub_agent".equals(msg.role)) {
+                    msg.expanded = !msg.expanded;
+                }
+            }
+            return UpdateResult.from(this);
+        }
+
+        // ctrl+j: insert newline without sending
+        if (key.equals("ctrl+j")) {
+            inputBuffer.append('\n');
+            return UpdateResult.from(this);
+        }
+
+        // escape during streaming: move agent to background
+        if (key.equals("escape") && streaming) {
+            chatMessages.add(new ChatMessage("system",
+                    "Agent moved to background. You will be notified when it completes."));
+            streaming = false;
+            agentQueue = null;
+            return UpdateResult.from(this);
+        }
+
+        // pgup/pgdown/home/end: viewport scrolling
+        if (key.equals("pgup")) {
+            scrollOffset = Math.min(scrollOffset + Math.max(height - 6, 1), chatMessages.size());
+            userScrolled = true;
+            return UpdateResult.from(this);
+        }
+        if (key.equals("pgdown")) {
+            scrollOffset = Math.max(scrollOffset - Math.max(height - 6, 1), 0);
+            userScrolled = scrollOffset > 0;
+            return UpdateResult.from(this);
+        }
+        if (key.equals("home")) {
+            scrollOffset = Math.max(chatMessages.size() - 1, 0);
+            userScrolled = true;
+            return UpdateResult.from(this);
+        }
+        if (key.equals("end")) {
+            scrollOffset = 0;
+            userScrolled = false;
+            return UpdateResult.from(this);
+        }
+
+        // Slash menu open: handle navigation
+        if (slashMenuOpen) {
+            return switch (key) {
+                case "up" -> {
+                    if (slashCursor > 0) slashCursor--;
+                    yield UpdateResult.from(this);
+                }
+                case "down" -> {
+                    if (slashCursor < slashMatches.size() - 1) slashCursor++;
+                    yield UpdateResult.from(this);
+                }
+                case "enter", "tab" -> {
+                    if (!slashMatches.isEmpty()) {
+                        var cmd = slashMatches.get(slashCursor);
+                        inputBuffer.setLength(0);
+                        slashMenuOpen = false;
+                        yield executeSlashCommand(cmd, "");
+                    }
+                    yield UpdateResult.from(this);
+                }
+                case "escape" -> {
+                    slashMenuOpen = false;
+                    yield UpdateResult.from(this);
+                }
+                default -> {
+                    if (key.equals("backspace") || key.equals("ctrl+h")) {
+                        if (!inputBuffer.isEmpty()) inputBuffer.deleteCharAt(inputBuffer.length() - 1);
+                        updateSlashMenu();
+                    } else {
+                        char[] runes = kpm.runes();
+                        if (runes != null && runes.length > 0) {
+                            for (char ch : runes) if (ch >= 32) inputBuffer.append(ch);
+                        } else if (key.length() == 1 && key.charAt(0) >= 32) {
+                            inputBuffer.append(key.charAt(0));
+                        }
+                        updateSlashMenu();
+                    }
+                    yield UpdateResult.from(this);
+                }
+            };
+        }
+
+        // @ file menu open: handle navigation
+        if (atMenuOpen) {
+            return switch (key) {
+                case "up" -> { if (atCursor > 0) atCursor--; yield UpdateResult.from(this); }
+                case "down" -> { if (atCursor < atMatches.size() - 1) atCursor++; yield UpdateResult.from(this); }
+                case "enter", "tab" -> {
+                    if (!atMatches.isEmpty()) {
+                        String selected = atMatches.get(atCursor);
+                        int atIdx = inputBuffer.lastIndexOf("@");
+                        if (atIdx >= 0) inputBuffer.replace(atIdx, inputBuffer.length(), "@" + selected + " ");
+                    }
+                    atMenuOpen = false;
+                    yield UpdateResult.from(this);
+                }
+                case "escape" -> { atMenuOpen = false; yield UpdateResult.from(this); }
+                default -> {
+                    if (key.equals("backspace") || key.equals("ctrl+h")) {
+                        if (!inputBuffer.isEmpty()) inputBuffer.deleteCharAt(inputBuffer.length() - 1);
+                        updateAtMenu();
+                    } else {
+                        char[] runes = kpm.runes();
+                        if (runes != null && runes.length > 0) {
+                            for (char ch : runes) if (ch >= 32) inputBuffer.append(ch);
+                        } else if (key.length() == 1 && key.charAt(0) >= 32) {
+                            inputBuffer.append(key.charAt(0));
+                        }
+                        updateAtMenu();
+                    }
+                    yield UpdateResult.from(this);
+                }
+            };
+        }
+
+        // Enter sends a message or slash command
+        if (key.equals("enter")) {
+            if (inputBuffer.isEmpty()) return UpdateResult.from(this);
+            if (streaming) {
+                savePartialResponse();
+            }
+            String text = inputBuffer.toString().trim();
+            if (text.startsWith("/")) {
+                String[] parts = text.substring(1).split("\\s+", 2);
+                String cmdName = parts[0];
+                String cmdArgs = parts.length > 1 ? parts[1] : "";
+                var cmd = cmdRegistry.find(cmdName);
+                if (cmd.isPresent()) {
+                    inputBuffer.setLength(0);
+                    return executeSlashCommand(cmd.get(), cmdArgs);
+                } else {
+                    inputBuffer.setLength(0);
+                    chatMessages.add(new ChatMessage("error",
+                            "Unknown command: /" + cmdName + " — type /help to see available commands"));
+                    return UpdateResult.from(this);
+                }
+            }
+            return sendUserMessage();
+        }
+
+        // History navigation (up/down when not streaming)
+        if (!streaming && (key.equals("up") || key.equals("down"))) {
+            var entries = historyStore.getEntries();
+            if (!entries.isEmpty()) {
+                if (key.equals("up")) {
+                    if (historyIndex < 0) {
+                        historyDraft = inputBuffer.toString();
+                        historyIndex = entries.size() - 1;
+                    } else if (historyIndex > 0) {
+                        historyIndex--;
+                    }
+                    inputBuffer.setLength(0);
+                    inputBuffer.append(entries.get(historyIndex));
+                } else {
+                    if (historyIndex >= 0) {
+                        historyIndex++;
+                        if (historyIndex >= entries.size()) {
+                            historyIndex = -1;
+                            inputBuffer.setLength(0);
+                            inputBuffer.append(historyDraft);
+                        } else {
+                            inputBuffer.setLength(0);
+                            inputBuffer.append(entries.get(historyIndex));
+                        }
+                    }
+                }
+            }
+            return UpdateResult.from(this);
+        }
+
+        // Backspace (DEL 0x7F on Linux/macOS, BS 0x08 aka ctrl+h on Windows)
+        if (key.equals("backspace") || key.equals("ctrl+h")) {
+            if (!inputBuffer.isEmpty()) {
+                inputBuffer.deleteCharAt(inputBuffer.length() - 1);
+                updateSlashMenu();
+            }
+            return UpdateResult.from(this);
+        }
+
+        // Space
+        if (key.equals("space") || key.equals(" ")) {
+            inputBuffer.append(' ');
+            return UpdateResult.from(this);
+        }
+
+        // Tab
+        if (key.equals("tab")) {
+            inputBuffer.append("    ");
+            return UpdateResult.from(this);
+        }
+
+        // Regular character input — use runes() for Unicode support (Chinese, etc.)
+        char[] runes = kpm.runes();
+        if (runes != null && runes.length > 0) {
+            for (char ch : runes) {
+                if (ch >= 32) {
+                    inputBuffer.append(ch);
+                }
+            }
+            if (inputBuffer.length() == 1 && inputBuffer.charAt(0) == '/') {
+                updateSlashMenu();
+            } else if (slashMenuOpen) {
+                updateSlashMenu();
+            }
+            // Check for @ trigger
+            String text = inputBuffer.toString();
+            int atIdx = text.lastIndexOf('@');
+            if (atIdx >= 0 && !text.substring(atIdx).contains(" ")) {
+                updateAtMenu();
+            }
+            return UpdateResult.from(this);
+        }
+
+        // Fallback: single printable key string (ASCII)
+        if (key.length() == 1 && key.charAt(0) >= 32) {
+            inputBuffer.append(key.charAt(0));
+            if (key.charAt(0) == '/' && inputBuffer.length() == 1) {
+                updateSlashMenu();
+            } else if (slashMenuOpen) {
+                updateSlashMenu();
+            }
+            if (key.charAt(0) == '@') updateAtMenu();
+            return UpdateResult.from(this);
+        }
+
+        return UpdateResult.from(this);
+    }
+
+    private void updateSlashMenu() {
+        String text = inputBuffer.toString();
+        if (text.startsWith("/") && !text.contains(" ")) {
+            String prefix = text.substring(1);
+            slashMatches = cmdRegistry.search(prefix);
+            slashMenuOpen = !slashMatches.isEmpty();
+            slashCursor = 0;
+        } else {
+            slashMenuOpen = false;
+        }
+    }
+
+    private void updateAtMenu() {
+        String text = inputBuffer.toString();
+        int atIdx = text.lastIndexOf('@');
+        if (atIdx < 0) { atMenuOpen = false; return; }
+        String prefix = text.substring(atIdx + 1);
+        if (prefix.contains(" ")) { atMenuOpen = false; return; }
+
+        var skipDirs = Set.of(".git", "node_modules", ".venv", "__pycache__", ".codepaw", "build", ".gradle");
+        var matches = new ArrayList<String>();
+        try {
+            var dir = Path.of(System.getProperty("user.dir"));
+            try (var stream = java.nio.file.Files.list(dir)) {
+                stream.filter(p -> {
+                    String name = p.getFileName().toString();
+                    if (name.startsWith(".") && prefix.isEmpty()) return false;
+                    if (skipDirs.contains(name)) return false;
+                    return prefix.isEmpty() || name.toLowerCase().startsWith(prefix.toLowerCase());
+                }).sorted().limit(10).forEach(p -> matches.add(p.getFileName().toString()));
+            }
+        } catch (Exception ignored) {}
+
+        atMatches = matches;
+        atMenuOpen = !matches.isEmpty();
+        atCursor = 0;
+    }
+
+    private static final Set<String> AT_SKIP_DIRS = Set.of(
+            ".git", "node_modules", ".venv", "__pycache__", ".codepaw", "build", ".gradle");
+
+    private UpdateResult<CodePawModel> executeSlashCommand(com.codepaw.command.Command cmd, String args) {
+        return switch (cmd.type()) {
+            case LOCAL -> {
+                var ctx = buildCommandContext(args);
+                String output = cmdRegistry.execute(cmd.name(), ctx);
+                if (output != null && !output.isEmpty()) {
+                    chatMessages.add(new ChatMessage("system", output));
+                }
+                yield UpdateResult.from(this);
+            }
+            case LOCAL_UI -> {
+                switch (cmd.name()) {
+                    case "clear" -> {
+                        chatMessages.clear();
+                        conversation = new ConversationManager();
+                    }
+                    case "compact" -> {
+                        if (agent != null) {
+                            try {
+                                var schemas = agent.getRegistry() != null
+                                        ? agent.getRegistry().getAllSchemas(agent.getProtocol())
+                                        : java.util.List.<java.util.Map<String, Object>>of();
+                                String msg = com.codepaw.compact.ContextCompactor.forceCompact(
+                                        conversation, client, selectedProvider.resolvedContextWindow(),
+                                        System.getProperty("user.dir"), sessionId,
+                                        agent.getRecoveryState(), schemas);
+                                chatMessages.add(new ChatMessage("system", "⟳ " + msg));
+                            } catch (Exception e) {
+                                chatMessages.add(new ChatMessage("error", "Compact failed: " + e.getMessage()));
+                            }
+                        }
+                    }
+                    case "plan" -> {
+                        if (permChecker != null) {
+                            prePlanMode = permChecker.getMode();
+                            permChecker.setMode(PermissionMode.PLAN);
+                            String planPath = PlanFile.getOrCreatePlanPath(
+                                    System.getProperty("user.dir"));
+                            chatMessages.add(new ChatMessage("system",
+                                    "Entered Plan mode. Plan file: %s\nExplore the codebase and design your approach."
+                                            .formatted(planPath)));
+                        }
+                    }
+                    case "resume" -> {
+                        resumeSessions = SessionManager.listSessions(System.getProperty("user.dir"));
+                        resumeFiltered = new ArrayList<>(resumeSessions);
+                        resumeCursor = 0;
+                        resumeSearch = "";
+                        state = AppState.RESUME;
+                    }
+                    case "rewind" -> {
+                        if (fileHistory == null || !fileHistory.hasSnapshots()) {
+                            chatMessages.add(new ChatMessage("system", "No checkpoints to rewind to."));
+                        } else {
+                            rewindSnapshots = fileHistory.getSnapshots();
+                            rewindCursor = rewindSnapshots.size() - 1;
+                            rewindPhase = 0;
+                            rewindOptionCursor = 0;
+                            rewindDialog = true;
+                        }
+                    }
+                }
+                yield UpdateResult.from(this);
+            }
+            case PROMPT -> {
+                boolean isSkill = cmd.description() != null && cmd.description().endsWith("[skill]");
+                String prompt = cmdRegistry.execute(cmd.name(), buildCommandContext(args));
+
+                String displayText = "/" + cmd.name();
+                if (args != null && !args.isEmpty()) displayText += " " + args;
+                chatMessages.add(new ChatMessage("user", displayText));
+                SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "user", displayText);
+                userHasSentMessage = true;
+
+                if (prompt != null && !prompt.isBlank()) {
+                    conversation.addUserMessage(prompt);
+                }
+                if (args != null && !args.isEmpty()) {
+                    conversation.addUserMessage(args);
+                }
+
+                streaming = true;
+                streamBuf.setLength(0);
+                thinkingVerb = SpinnerVerbs.random();
+                thinkingStartMs = System.currentTimeMillis();
+
+                fireHook(HookEngine.EventName.TURN_START, null, null);
+
+                try {
+                    agentQueue = agent.run(conversation);
+                    if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
+                } catch (Exception e) {
+                    streaming = false;
+                    chatMessages.add(new ChatMessage("error", "Agent error: " + e.getMessage()));
+                    yield UpdateResult.from(this);
+                }
+
+                var pollCmd = Command.tick(POLL_INTERVAL, t -> new AgentEventMessage());
+                if (isSkill) {
+                    String loadedLine = Styles.system.render(
+                        "  skill(" + cmd.name() + ")\n  Successfully loaded skill");
+                    yield UpdateResult.from(this, Command.batch(Command.println(loadedLine), pollCmd));
+                }
+                yield UpdateResult.from(this, pollCmd);
+            }
+        };
+    }
+
+    private com.codepaw.command.CommandContext buildCommandContext(String args) {
+        String workDir = System.getProperty("user.dir");
+        String model = selectedProvider != null ? selectedProvider.getModel() : "unknown";
+        return new com.codepaw.command.CommandContext(
+                args,
+                workDir,
+                model,
+                () -> permChecker != null ? permChecker.getMode().name().toLowerCase() : "default",
+                () -> registry != null ? registry.listTools().size() : 0,
+                () -> new int[]{totalInput, totalOutput},
+                () -> memoryManager != null ? memoryManager.getMemories() : java.util.List.of(),
+                () -> { if (memoryManager != null) memoryManager.clear(); },
+                () -> sessionId != null ? "Session: " + sessionId : "No active session",
+                () -> skillCatalog != null
+                        ? skillCatalog.list().stream().map(s -> s.name()).toList()
+                        : java.util.List.of(),
+                () -> mcpServerInfo
+        );
+    }
+
