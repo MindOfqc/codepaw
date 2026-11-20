@@ -2,6 +2,12 @@
 
 CodePaw 是一个 AI Coding Agent 的完整实现，帮助你理解 AI Agent 的核心原理与工程实践。
 
+## 运行界面
+
+以下为 CodePaw 在本机实际启动后的终端界面截图，使用本地演示配置，未发送模型请求。
+
+![CodePaw 终端运行界面](docs/screenshots/codepaw-terminal.png)
+
 ## 环境要求
 
 - Java 21+
