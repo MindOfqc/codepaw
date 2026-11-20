@@ -1868,3 +1868,345 @@ public class CodePawModel implements Model {
     // AskUser dialog
     // ────────────────────────────────────────────────────────────────────
 
+    private UpdateResult<CodePawModel> handleAskUserDialogKey(KeyPressMessage kpm) {
+        var result = askUserDialogState.handleKey(kpm.key());
+        if (result != null) {
+            if (askUserFuture != null) {
+                askUserFuture.complete(result);
+                askUserFuture = null;
+            }
+        }
+        return UpdateResult.from(this);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Chat view rendering
+    // ────────────────────────────────────────────────────────────────────
+
+    private String viewChat() {
+        var sb = new StringBuilder();
+        boolean hasMessages = !chatMessages.isEmpty() || streaming;
+
+        if (!hasMessages || !userHasSentMessage) {
+            sb.append(renderBanner());
+            sb.append("\n\n");
+        }
+
+        // ── Messages (with scroll support) ──────────────────────────────
+        int startIdx = 0;
+        int endIdx = chatMessages.size();
+        if (scrollOffset > 0) {
+            endIdx = Math.max(0, chatMessages.size() - scrollOffset);
+            startIdx = Math.max(0, endIdx - Math.max(height - 8, 5));
+        }
+
+        for (int idx = startIdx; idx < endIdx; idx++) {
+            var msg = chatMessages.get(idx);
+            switch (msg.role) {
+                case "user" -> {
+                    sb.append(Styles.prompt.render("❯ "));
+                    sb.append(Styles.userText.render(msg.content));
+                    sb.append("\n\n");
+                }
+                case "assistant" -> {
+                    sb.append(Styles.aiMarker.render("● "));
+                    sb.append(MarkdownRenderer.render(msg.content, width));
+                    sb.append("\n");
+                }
+                case "thinking" -> {
+                    if (msg.content != null) {
+                        sb.append(Styles.toolDetail.render("  "));
+                        String preview = msg.content.length() > 80
+                                ? msg.content.substring(0, 77) + "..."
+                                : msg.content;
+                        sb.append(Styles.toolDetail.render(preview));
+                        sb.append("\n");
+                    }
+                }
+                case "tool" -> {
+                    sb.append(Styles.toolRunning.render("  " + msg.content));
+                    sb.append("\n");
+                }
+                case "tool_visible" -> {
+                    sb.append("  ");
+                    if (msg.content != null && msg.content.startsWith("✗")) {
+                        sb.append(Styles.toolError.render(msg.content));
+                    } else {
+                        sb.append(Styles.toolDone.render(msg.content));
+                    }
+                    sb.append("\n");
+                }
+                case "tool_collapsed" -> {
+                    if (msg.toolGroup != null) {
+                        if (msg.expanded) {
+                            for (var tb : msg.toolGroup) {
+                                sb.append("  ");
+                                String text = renderToolBlockText(tb);
+                                sb.append(tb.isError()
+                                        ? Styles.toolError.render(text)
+                                        : Styles.toolDone.render(text));
+                                sb.append("\n");
+                            }
+                        } else {
+                            sb.append(Styles.toolDone.render("  " + renderToolGroupSummary(msg.toolGroup)));
+                            sb.append(Styles.toolDetail.render("  (ctrl+o to expand)"));
+                            sb.append("\n");
+                        }
+                    }
+                }
+                case "tool_group" -> {
+                    if (msg.expanded && msg.toolGroup != null) {
+                        for (var tb : msg.toolGroup) {
+                            sb.append("  ");
+                            String text = renderToolBlockText(tb);
+                            sb.append(tb.isError()
+                                    ? Styles.toolError.render(text)
+                                    : Styles.toolDone.render(text));
+                            sb.append("\n");
+                        }
+                    } else if (msg.toolGroup != null) {
+                        sb.append(Styles.toolDone.render("  " + renderToolGroupSummary(msg.toolGroup)));
+                        sb.append(Styles.toolDetail.render("  (ctrl+o to expand)"));
+                        sb.append("\n");
+                    }
+                }
+                case "sub_agent" -> {
+                    if (msg.subAgentBlock != null) {
+                        sb.append(renderSubAgentBlock(msg.subAgentBlock, msg.expanded));
+                    }
+                }
+                case "system" -> {
+                    sb.append(Styles.system.render("  " + msg.content));
+                    sb.append("\n");
+                }
+                case "error" -> {
+                    sb.append(Styles.error.render("  ✖ " + msg.content));
+                    sb.append("\n");
+                }
+                default -> {
+                    sb.append("  " + msg.content);
+                    sb.append("\n");
+                }
+            }
+        }
+
+        // ── Active tool blocks (in progress) ────────────────────────────
+        for (var tb : toolBlocks) {
+            if ("Agent".equals(tb.toolName()) && activeSubAgent != null) {
+                continue;
+            }
+            sb.append(renderToolBlock(tb));
+            sb.append("\n");
+        }
+
+        // ── Active sub-agent (in progress) ──────────────────────────────
+        if (activeSubAgent != null && !activeSubAgent.done) {
+            sb.append(renderSubAgentBlock(activeSubAgent, false));
+        }
+
+        // ── Streaming buffer (in-progress text) ─────────────────────────
+        if (streaming && !streamBuf.isEmpty()) {
+            sb.append(Styles.aiMarker.render("● "));
+            sb.append(Styles.streamingText.render(streamBuf.toString()));
+            sb.append("\n");
+        }
+
+        // ── Persistent spinner (runs until LoopComplete) ─────────────────
+        if (streaming) {
+            double elapsed = (System.currentTimeMillis() - thinkingStartMs) / 1000.0;
+            String frame = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length];
+            sb.append(Styles.thinking.render("  %s %s…  (%.0fs)".formatted(frame, thinkingVerb, elapsed)));
+            sb.append("\n");
+            // ── Teammate spinner tree (shown below lead spinner) ──────
+            sb.append(renderTeammateTree());
+        }
+
+        // ── Permission dialog overlay ────────────────────────────────────
+        if (permDialog) {
+            sb.append("\n");
+            sb.append(Styles.permBorder.render("  ┌─ Permission Required ─────────────────┐"));
+            sb.append("\n");
+            sb.append(Styles.permBorder.render("  │ "));
+            sb.append(permToolName);
+            sb.append("\n");
+            sb.append(Styles.permDim.render("  │ " + permDesc));
+            sb.append("\n");
+            sb.append(Styles.permBorder.render("  │"));
+            sb.append("\n");
+            String[] options = {"Yes", "Yes, don't ask again", "No"};
+            for (int i = 0; i < options.length; i++) {
+                String marker = i == permCursor ? " ❯ " : "   ";
+                var style = i == permCursor ? Styles.selectedItem : Styles.normalItem;
+                sb.append(style.render("  │" + marker + options[i]));
+                sb.append("\n");
+            }
+            sb.append(Styles.permBorder.render("  └─────────────────────────────────────────┘"));
+            sb.append("\n");
+        }
+
+        // ── Rewind dialog overlay ────────────────────────────────────────
+        if (rewindDialog && rewindSnapshots != null) {
+            sb.append("\n");
+            sb.append(Styles.selectedItem.render("  ⟲ Rewind to checkpoint"));
+            sb.append("\n\n");
+
+            if (rewindPhase == 0) {
+                int maxVisible = 8;
+                int start = Math.max(0, rewindCursor - maxVisible + 1);
+                int end = Math.min(start + maxVisible, rewindSnapshots.size());
+                for (int i = start; i < end; i++) {
+                    var snap = rewindSnapshots.get(i);
+                    String marker = i == rewindCursor ? " ❯ " : "   ";
+                    var style = i == rewindCursor ? Styles.selectedItem : Styles.normalItem;
+                    String label = snap.userText();
+                    if (label.length() > 50) label = label.substring(0, 50) + "…";
+                    long secs = java.time.Duration.between(snap.timestamp(), java.time.Instant.now()).getSeconds();
+                    sb.append(style.render("%s[%d] %s (%ds ago, %d file(s))".formatted(
+                            marker, i + 1, label, secs, snap.backups().size())));
+                    sb.append("\n");
+                }
+                sb.append("\n");
+                sb.append(Styles.normalItem.render("  ↑/↓ navigate · enter select · esc cancel"));
+            } else {
+                var snap = rewindSnapshots.get(rewindCursor);
+                String label = snap.userText();
+                if (label.length() > 50) label = label.substring(0, 50) + "…";
+                long secs = java.time.Duration.between(snap.timestamp(), java.time.Instant.now()).getSeconds();
+                sb.append(Styles.normalItem.render("  Selected: [%d] %s (%ds ago, %d file(s))".formatted(
+                        rewindCursor + 1, label, secs, snap.backups().size())));
+                sb.append("\n\n");
+                for (int i = 0; i < REWIND_OPTIONS.length; i++) {
+                    String marker = i == rewindOptionCursor ? " ❯ " : "   ";
+                    var style = i == rewindOptionCursor ? Styles.selectedItem : Styles.normalItem;
+                    sb.append(style.render(marker + REWIND_OPTIONS[i]));
+                    sb.append("\n");
+                }
+                sb.append("\n");
+                sb.append(Styles.normalItem.render("  ↑/↓ navigate · enter select · esc back"));
+            }
+            sb.append("\n");
+        }
+
+        // ── AskUser dialog overlay ───────────────────────────────────────
+        if (askUserDialogState.isActive()) {
+            sb.append("\n");
+            sb.append(askUserDialogState.render(width));
+        }
+
+        // ── Plan approval dialog overlay ─────────────────────────────────
+        if (planApprovalDialog.isActive()) {
+            sb.append("\n");
+            sb.append(planApprovalDialog.render());
+        }
+
+        // ── Separator ───────────────────────────────────────────────────
+        String sep = "─".repeat(Math.max(width - 2, 20));
+        sb.append(Styles.separator.render(sep));
+        sb.append("\n");
+
+        // ── Input area ──────────────────────────────────────────────────
+        if (streaming) {
+            // Input disabled during streaming; spinner is in chat content above
+        } else {
+            if (inputBuffer.isEmpty()) {
+                sb.append(Styles.prompt.render("❯ "));
+                sb.append(Styles.placeholder.render("Send a message..."));
+                sb.append("\n");
+            } else {
+                String[] inputLines = inputBuffer.toString().split("\n", -1);
+                for (int i = 0; i < inputLines.length; i++) {
+                    if (i == 0) {
+                        sb.append(Styles.prompt.render("❯ "));
+                    } else {
+                        sb.append("  ");
+                    }
+                    sb.append(inputLines[i]);
+                    if (i == inputLines.length - 1) sb.append("█");
+                    sb.append("\n");
+                }
+            }
+        }
+        if (streaming) sb.append("\n");
+
+        // ── Slash menu (below input) ─────────────────────────────────────
+        if (slashMenuOpen && !slashMatches.isEmpty()) {
+            for (int i = 0; i < slashMatches.size() && i < 8; i++) {
+                var cmd = slashMatches.get(i);
+                String marker = i == slashCursor ? " ❯ " : "   ";
+                var style = i == slashCursor ? Styles.selectedItem : Styles.normalItem;
+                sb.append(style.render(marker + "/" + cmd.name() + " — " + cmd.description()));
+                sb.append("\n");
+            }
+        }
+
+        // ── @ file menu (below input) ────────────────────────────────────
+        if (atMenuOpen && !atMatches.isEmpty()) {
+            for (int i = 0; i < atMatches.size() && i < 8; i++) {
+                String marker = i == atCursor ? " ❯ " : "   ";
+                var style = i == atCursor ? Styles.selectedItem : Styles.normalItem;
+                sb.append(style.render(marker + "@" + atMatches.get(i)));
+                sb.append("\n");
+            }
+        }
+
+        // ── Status bar ──────────────────────────────────────────────────
+        sb.append(Styles.separator.render("─".repeat(Math.max(width, 20))));
+        sb.append("\n");
+
+        String modeStr;
+        var modeStyle = Styles.modeDefault;
+        if (permChecker != null) {
+            var mode = permChecker.getMode();
+            modeStr = switch (mode) {
+                case DEFAULT -> "default";
+                case ACCEPT_EDITS -> "accept-edits";
+                case PLAN -> "plan";
+                case BYPASS -> "YOLO";
+            };
+            modeStyle = switch (mode) {
+                case DEFAULT -> Styles.modeDefault;
+                case ACCEPT_EDITS -> Styles.modeAcceptEdits;
+                case PLAN -> Styles.modePlan;
+                case BYPASS -> Styles.modeBypass;
+            };
+        } else {
+            modeStr = "default";
+        }
+
+        String left = modeStyle.render("  " + modeStr);
+        if (permChecker != null && permChecker.getMode() != PermissionMode.DEFAULT) {
+            left += Styles.toolDetail.render(" (shift+tab)");
+        }
+
+        // Active teammates indicator
+        long activeTeammates = teamManager.getAllTeammateProgress().stream()
+                .filter(p -> "running".equals(p.getStatus()))
+                .count();
+        String teammateStr = "";
+        if (activeTeammates > 0) {
+            teammateStr = " · " + activeTeammates + " teammate" + (activeTeammates > 1 ? "s" : "");
+            left += Styles.cyan(teammateStr);
+        }
+
+        var rightParts = new StringBuilder();
+        if (mcpConnecting) {
+            rightParts.append(Styles.modePlan.render("MCP connecting… "));
+        }
+        String modelStr = selectedProvider != null ? selectedProvider.getModel() : "";
+        if (!modelStr.isEmpty()) {
+            rightParts.append(Styles.statusItem.render(modelStr));
+        }
+
+        int leftLen = modeStr.length() + 2 + (permChecker != null
+                && permChecker.getMode() != PermissionMode.DEFAULT ? 12 : 0)
+                + teammateStr.length();
+        int rightLen = (mcpConnecting ? 17 : 0) + modelStr.length();
+        int gap = Math.max(width - leftLen - rightLen - 2, 2);
+        sb.append(left);
+        sb.append(" ".repeat(gap));
+        sb.append(rightParts);
+        sb.append("\n");
+
+        return sb.toString();
+    }
+}
