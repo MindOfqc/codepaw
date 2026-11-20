@@ -1079,3 +1079,379 @@ public class CodePawModel implements Model {
         );
     }
 
+    private UpdateResult<CodePawModel> sendUserMessage() {
+        String userText = inputBuffer.toString().trim();
+        inputBuffer.setLength(0);
+        userScrolled = false;
+        scrollOffset = 0;
+
+        if (userText.isEmpty()) {
+            return UpdateResult.from(this);
+        }
+
+        if (conversation.getMessages().isEmpty() && memoryManager != null) {
+            memoryManager.injectMemories(conversation);
+        }
+
+        chatMessages.add(new ChatMessage("user", userText));
+        userHasSentMessage = true;
+        conversation.addUserMessage(userText);
+        SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "user", userText);
+        historyStore.append(userText);
+        historyIndex = -1;
+
+        if (!mcpInstructions.isEmpty() && !mcpInstructionsOk) {
+            conversation.addSystemReminder(mcpInstructions);
+            mcpInstructionsOk = true;
+        }
+
+        // Start memory recall prefetch — runs in a virtual thread with 8s timeout.
+        var prefetchFuture = prefetchRelevantMemories(userText);
+
+        if (agent == null) {
+            chatMessages.add(new ChatMessage("error", "No agent configured."));
+            return UpdateResult.from(this);
+        }
+
+        streaming = true;
+        streamBuf.setLength(0);
+        thinkingVerb = SpinnerVerbs.random();
+        thinkingStartMs = System.currentTimeMillis();
+
+        fireHook(HookEngine.EventName.TURN_START, null, null);
+
+        // Collect prefetched recall with 3s timeout, inject as system-reminder.
+        collectPrefetchedRecall(conversation, prefetchFuture);
+
+        try {
+            agentQueue = agent.run(conversation);
+            if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
+        } catch (Exception e) {
+            streaming = false;
+            chatMessages.add(new ChatMessage("error", "Agent error: " + e.getMessage()));
+            return UpdateResult.from(this);
+        }
+
+        Command pollCmd = Command.tick(POLL_INTERVAL, t -> new AgentEventMessage());
+        return UpdateResult.from(this, pollCmd);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Streaming event processing
+    // ────────────────────────────────────────────────────────────────────
+
+    private UpdateResult<CodePawModel> handleAgentEvents() {
+        drainSubAgentProgress();
+
+        if (agentQueue == null) return UpdateResult.from(this);
+
+        var events = new ArrayList<AgentEvent>();
+        agentQueue.drainTo(events);
+
+        boolean loopDone = false;
+
+        for (var event : events) {
+            switch (event) {
+                case AgentEvent.StreamText e -> streamBuf.append(e.text());
+                case AgentEvent.ThinkingText e -> {}
+                case AgentEvent.ThinkingComplete e -> {}
+                case AgentEvent.ToolUseEvent e -> {
+                    boolean found = false;
+                    for (int i = 0; i < toolBlocks.size(); i++) {
+                        if (toolBlocks.get(i).toolName().equals(e.toolName())
+                                && toolBlocks.get(i).args() == null) {
+                            toolBlocks.set(i, new ChatMessage.ToolBlockInfo(
+                                    e.toolName(), e.args(), null, false, 0, false, true));
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        toolBlocks.add(new ChatMessage.ToolBlockInfo(
+                                e.toolName(), e.args(), null, false, 0, false, true));
+                    }
+                }
+                case AgentEvent.ToolResultEvent e -> {
+                    for (int i = 0; i < toolBlocks.size(); i++) {
+                        var tb = toolBlocks.get(i);
+                        if (tb.toolName().equals(e.toolName()) && tb.loading()) {
+                            toolBlocks.set(i, new ChatMessage.ToolBlockInfo(
+                                    e.toolName(), tb.args(), e.output(), e.isError(),
+                                    e.elapsed(), true, false));
+                            break;
+                        }
+                    }
+                }
+                case AgentEvent.TurnComplete e -> {
+                    if (!streamBuf.isEmpty()) {
+                        chatMessages.add(new ChatMessage("assistant", streamBuf.toString()));
+                        streamBuf.setLength(0);
+                    }
+                    commitToolBlocks();
+                }
+                case AgentEvent.LoopComplete e -> {
+                    loopDone = true;
+                    if (!streamBuf.isEmpty()) {
+                        chatMessages.add(new ChatMessage("assistant", streamBuf.toString()));
+                        SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "assistant", streamBuf.toString());
+                        streamBuf.setLength(0);
+                    }
+                    commitToolBlocks();
+                    double totalTime = (System.currentTimeMillis() - thinkingStartMs) / 1000.0;
+                    String pastVerb = SpinnerVerbs.pastTense(thinkingVerb);
+                    chatMessages.add(new ChatMessage("thinking",
+                            "✻ %s for %.1fs".formatted(pastVerb, totalTime)));
+                    fireHook(HookEngine.EventName.TURN_END, null, null);
+                }
+                case AgentEvent.UsageEvent e -> {
+                    totalInput = e.inputTokens();
+                    totalOutput = e.outputTokens();
+                }
+                case AgentEvent.ErrorEvent e ->
+                        chatMessages.add(new ChatMessage("error", e.message()));
+                case AgentEvent.CompactEvent e ->
+                        chatMessages.add(new ChatMessage("system", "⟳ " + e.message()));
+                case AgentEvent.RetryEvent e -> {
+                    String msg = "↻ Retrying: " + e.reason();
+                    if (e.waitMs() > 0) msg += " (waiting %dms)".formatted(e.waitMs());
+                    chatMessages.add(new ChatMessage("system", msg));
+                }
+                case AgentEvent.PermissionRequestEvent e -> {
+                    permDialog = true;
+                    permToolName = e.toolName();
+                    permDesc = e.description();
+                    permCursor = 0;
+                    pendingPermission = e.future();
+                }
+                case AgentEvent.AskUserRequestEvent e -> {
+                    askUserDialogState.activate(e.questions());
+                    askUserFuture = e.future();
+                }
+            }
+        }
+
+        if (!userScrolled) {
+            scrollOffset = 0;
+        }
+
+        if (loopDone) {
+            streaming = false;
+            agentQueue = null;
+            drainTaskNotifications();
+            triggerMemoryExtraction();
+            if (permChecker != null && permChecker.getMode() == PermissionMode.PLAN) {
+                planApprovalDialog.activate();
+            }
+            if (teamManager != null) {
+                var mailboxPoll = Command.tick(Duration.ofSeconds(2), t -> new MailboxPollMessage());
+                return UpdateResult.from(this, mailboxPoll);
+            }
+            return UpdateResult.from(this);
+        }
+
+        Command pollCmd = Command.tick(POLL_INTERVAL, t -> new AgentEventMessage());
+        return UpdateResult.from(this, pollCmd);
+    }
+
+    private void fireHook(HookEngine.EventName event, String toolName, Map<String, Object> args) {
+        if (hookEngine == null) return;
+        var ctx = new HookEngine.HookContext(event, toolName, args, null, null, null);
+        hookEngine.runHooks(ctx);
+    }
+
+    private String buildMemorySection() {
+        if (memoryManager == null) return "";
+        var memories = memoryManager.getMemories();
+        if (memories.isEmpty()) return "";
+        var sb = new StringBuilder("# Auto Memory\n\n");
+        for (String mem : memories) {
+            sb.append(mem).append("\n\n");
+        }
+        return sb.toString();
+    }
+
+    private void triggerMemoryExtraction() {
+        if (memoryManager == null || client == null) return;
+        if (!memoryManager.shouldExtract()) return;
+        Thread.startVirtualThread(() -> memoryManager.extract(client, conversation));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Memory recall prefetch
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * Runs the recall selector in a virtual thread and returns a future
+     * that will complete with the rendered system-reminder string (or ""
+     * if nothing was selected / selector timed out). Fires a fresh
+     * side-query LlmClient per call so the selector's SYSTEM prompt is
+     * independent of the main conversation's system prompt.
+     */
+    private CompletableFuture<String> prefetchRelevantMemories(String query) {
+        if (memoryManager == null || selectedProvider == null) {
+            return CompletableFuture.completedFuture("");
+        }
+        var provider = selectedProvider;
+        var userDir = memoryManager.userMemDir();
+        var projectDir = memoryManager.projectMemDir();
+
+        return CompletableFuture.supplyAsync(() -> {
+            MemoryRecall.SelectorFn selector = (systemPrompt, userMessage) -> {
+                LlmClient sideClient = LlmClient.create(provider, systemPrompt);
+                ConversationManager miniConv = new ConversationManager();
+                miniConv.addUserMessage(userMessage);
+                BlockingQueue<com.codepaw.llm.StreamEvent> events = sideClient.stream(miniConv, null);
+                var sb = new StringBuilder();
+                while (true) {
+                    var event = events.take();
+                    if (event instanceof com.codepaw.llm.StreamEvent.TextDelta td) {
+                        sb.append(td.text());
+                    } else if (event instanceof com.codepaw.llm.StreamEvent.StreamEnd
+                            || event instanceof com.codepaw.llm.StreamEvent.Error) {
+                        break;
+                    }
+                }
+                return sb.toString();
+            };
+            var results = MemoryRecall.findRelevantMemories(
+                    query, userDir, projectDir, null, null, selector);
+            return MemoryRecall.renderReminder(results);
+        }, runnable -> {
+            // Run on a virtual thread with 8s timeout.
+            Thread t = Thread.ofVirtual().name("memory-recall-prefetch").start(runnable);
+            Thread.ofVirtual().start(() -> {
+                try {
+                    if (!t.join(java.time.Duration.ofSeconds(8))) {
+                        t.interrupt();
+                    }
+                } catch (InterruptedException ignored) {}
+            });
+        });
+    }
+
+    /**
+     * Waits up to 3 seconds for the prefetch future to produce a rendered
+     * reminder, then injects it as a system-reminder on the given
+     * conversation. If the timeout fires first, the prefetch keeps running
+     * but its result is dropped — recall is best-effort and must not stall
+     * the user's main request.
+     */
+    private static void collectPrefetchedRecall(
+            ConversationManager conv, CompletableFuture<String> prefetchFuture) {
+        if (conv == null || prefetchFuture == null) return;
+        try {
+            String reminder = prefetchFuture.get(3, TimeUnit.SECONDS);
+            if (reminder != null && !reminder.isEmpty()) {
+                conv.addSystemReminder(reminder);
+            }
+        } catch (Exception ignored) {
+            // Timeout or error — recall is best-effort, don't block the user.
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Tool block management
+    // ────────────────────────────────────────────────────────────────────
+
+    private static final Set<String> COLLAPSIBLE_TOOLS = Set.of(
+            "ReadFile", "Glob", "Grep", "ToolSearch");
+
+    private static boolean isCollapsibleTool(String name) {
+        return COLLAPSIBLE_TOOLS.contains(name);
+    }
+
+    private void commitToolBlocks() {
+        if (toolBlocks.isEmpty()) return;
+
+        var visibleTools = new ArrayList<ChatMessage.ToolBlockInfo>();
+        var collapsedTools = new ArrayList<ChatMessage.ToolBlockInfo>();
+
+        for (var tb : toolBlocks) {
+            if ("Agent".equals(tb.toolName()) && activeSubAgent != null) {
+                if (!activeSubAgent.done) {
+                    activeSubAgent.done = true;
+                    activeSubAgent.toolCount = activeSubAgent.toolUses.size();
+                    double total = 0;
+                    for (var tu : activeSubAgent.toolUses) total += tu.elapsed();
+                    activeSubAgent.totalTime = total;
+                }
+                var msg = new ChatMessage("sub_agent", null);
+                msg.subAgentBlock = activeSubAgent;
+                msg.expanded = false;
+                chatMessages.add(msg);
+                activeSubAgent = null;
+            } else if (isCollapsibleTool(tb.toolName())) {
+                collapsedTools.add(tb);
+            } else {
+                visibleTools.add(tb);
+            }
+        }
+
+        for (var tb : visibleTools) {
+            chatMessages.add(new ChatMessage("tool_visible",
+                    renderToolBlockText(tb), List.of(tb)));
+        }
+
+        if (!collapsedTools.isEmpty()) {
+            var msg = new ChatMessage("tool_collapsed", null, new ArrayList<>(collapsedTools));
+            msg.expanded = false;
+            chatMessages.add(msg);
+        }
+
+        toolBlocks.clear();
+    }
+
+    private void savePartialResponse() {
+        if (!streamBuf.isEmpty()) {
+            chatMessages.add(new ChatMessage("assistant", streamBuf.toString()));
+            conversation.addAssistantMessage(streamBuf.toString());
+            SessionManager.saveMessage(System.getProperty("user.dir"), sessionId, "assistant", streamBuf.toString());
+            streamBuf.setLength(0);
+        }
+        commitToolBlocks();
+        chatMessages.add(new ChatMessage("system", "(response interrupted)"));
+        streaming = false;
+        agentQueue = null;
+        userScrolled = false;
+        scrollOffset = 0;
+    }
+
+    private static String renderToolBlockText(ChatMessage.ToolBlockInfo tb) {
+        String title = formatToolTitle(tb.toolName(),
+                tb.args() != null ? tb.args() : Map.of());
+        if (tb.isError()) {
+            return "✗ %s (%.1fs)".formatted(title, tb.elapsed());
+        }
+        return "✓ %s (%.1fs)".formatted(title, tb.elapsed());
+    }
+
+    private static String renderToolGroupSummary(List<ChatMessage.ToolBlockInfo> tools) {
+        double totalElapsed = 0;
+        int errors = 0;
+        for (var tb : tools) {
+            totalElapsed += tb.elapsed();
+            if (tb.isError()) errors++;
+        }
+        if (errors > 0) {
+            return "● Done (%d tool uses · %d errors · %.1fs)".formatted(
+                    tools.size(), errors, totalElapsed);
+        }
+        return "● Done (%d tool uses · %.1fs)".formatted(tools.size(), totalElapsed);
+    }
+
+    private String renderToolBlock(ChatMessage.ToolBlockInfo tb) {
+        String title = formatToolTitle(tb.toolName(),
+                tb.args() != null ? tb.args() : Map.of());
+        if (tb.loading()) {
+            return Styles.toolRunning.render("  ● %s …".formatted(title));
+        }
+        if (tb.isError()) {
+            return Styles.toolError.render("  ✗ %s — error (%.1fs)".formatted(title, tb.elapsed()));
+        }
+        return Styles.toolDone.render("  ✓ %s (%.1fs)".formatted(title, tb.elapsed()));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Sub-agent display
+    // ────────────────────────────────────────────────────────────────────
+
