@@ -1612,3 +1612,259 @@ public class CodePawModel implements Model {
     // Task notifications
     // ────────────────────────────────────────────────────────────────────
 
+    private void drainTaskNotifications() {
+        if (subAgentTaskManager == null) return;
+        var notifications = subAgentTaskManager.drainNotifications();
+        for (var n : notifications) {
+            chatMessages.add(new ChatMessage("system",
+                    "Task %s: %s (%s)".formatted(n.taskId(), n.name(), n.status())));
+        }
+    }
+
+    private static String formatToolTitle(String toolName, Map<String, Object> args) {
+        if (args == null || args.isEmpty()) return toolName;
+        return switch (toolName) {
+            case "ReadFile" -> {
+                var p = args.get("file_path");
+                yield "Read " + (p != null ? Path.of(p.toString()).getFileName() : toolName);
+            }
+            case "WriteFile" -> {
+                var p = args.get("file_path");
+                var content = args.get("content");
+                String name = p != null ? Path.of(p.toString()).getFileName().toString() : "file";
+                int lines = content instanceof String s ? s.split("\n", -1).length : 0;
+                yield lines > 0 ? "Write %s (%d lines)".formatted(name, lines) : "Write " + name;
+            }
+            case "EditFile" -> {
+                var p = args.get("file_path");
+                yield "Edit " + (p != null ? Path.of(p.toString()).getFileName() : toolName);
+            }
+            case "Bash" -> {
+                var cmd = args.get("command");
+                if (cmd == null) yield toolName;
+                String s = cmd.toString();
+                yield s.length() > 50 ? "Bash: " + s.substring(0, 47) + "…" : "Bash: " + s;
+            }
+            case "Glob" -> "Glob: " + args.getOrDefault("pattern", "");
+            case "Grep" -> "Grep: " + args.getOrDefault("pattern", "");
+            default -> toolName;
+        };
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Resume screen
+    // ────────────────────────────────────────────────────────────────────
+
+    private UpdateResult<CodePawModel> handleResumeKey(KeyPressMessage kpm) {
+        String key = kpm.key();
+        return switch (key) {
+            case "up", "k" -> { if (resumeCursor > 0) resumeCursor--; yield UpdateResult.from(this); }
+            case "down", "j" -> { if (resumeCursor < resumeFiltered.size() - 1) resumeCursor++; yield UpdateResult.from(this); }
+            case "escape" -> { state = AppState.CHAT; yield UpdateResult.from(this); }
+            case "enter" -> {
+                if (!resumeFiltered.isEmpty()) {
+                    var session = resumeFiltered.get(resumeCursor);
+                    var messages = SessionManager.loadSession(System.getProperty("user.dir"), session.id());
+                    sessionId = session.id();
+                    // Keep the Agent's session log pointer in sync so a later
+                    // compaction writes its boundary into this same file (chained
+                    // resume); the fileHistory pointer follows too.
+                    if (agent != null) agent.setSessionId(sessionId);
+                    fileHistory = new com.codepaw.filehistory.FileHistory(
+                            System.getProperty("user.dir"), sessionId);
+                    if (agent != null) agent.setFileHistory(fileHistory);
+
+                    // Compaction-aware rebuild: when the session has a
+                    // compact_boundary, the live conversation is the compacted
+                    // state (summary + kept tail + messages appended after the
+                    // boundary); the pre-compaction prefix stays in the file for
+                    // audit but is not replayed. Without a boundary (old sessions)
+                    // everything replays verbatim.
+                    conversation = SessionManager.rebuildConversation(messages);
+                    var scan = SessionManager.findLastCompactBoundary(messages);
+                    chatMessages.clear();
+                    if (scan.found()) {
+                        chatMessages.add(new ChatMessage("user", scan.boundary().summary()));
+                        for (var k : scan.boundary().keep()) {
+                            chatMessages.add(new ChatMessage(k.role(), k.content()));
+                        }
+                        for (var msg : scan.after()) {
+                            chatMessages.add(new ChatMessage(msg.role(), msg.content()));
+                        }
+                        chatMessages.add(new ChatMessage("system",
+                                "Resumed session %s from compacted state (summary + %d kept + %d newer messages)"
+                                        .formatted(session.id(), scan.boundary().keep().size(), scan.after().size())));
+                    } else {
+                        for (var msg : messages) {
+                            chatMessages.add(new ChatMessage(msg.role(), msg.content()));
+                        }
+                        chatMessages.add(new ChatMessage("system",
+                                "Resumed session " + session.id() + " (%d messages)".formatted(messages.size())));
+                    }
+                }
+                state = AppState.CHAT;
+                yield UpdateResult.from(this);
+            }
+            case "backspace", "ctrl+h" -> {
+                if (!resumeSearch.isEmpty()) {
+                    resumeSearch = resumeSearch.substring(0, resumeSearch.length() - 1);
+                    filterResumeSessions();
+                }
+                yield UpdateResult.from(this);
+            }
+            default -> {
+                char[] runes = kpm.runes();
+                if (runes != null && runes.length > 0) {
+                    for (char ch : runes) if (ch >= 32) resumeSearch += ch;
+                    filterResumeSessions();
+                }
+                yield UpdateResult.from(this);
+            }
+        };
+    }
+
+    private void filterResumeSessions() {
+        if (resumeSearch.isEmpty()) {
+            resumeFiltered = new ArrayList<>(resumeSessions);
+        } else {
+            String lower = resumeSearch.toLowerCase();
+            resumeFiltered = resumeSessions.stream()
+                    .filter(s -> s.firstMessage().toLowerCase().contains(lower)
+                            || s.id().contains(lower))
+                    .toList();
+        }
+        resumeCursor = 0;
+    }
+
+    private String viewResume() {
+        var sb = new StringBuilder();
+        sb.append(renderBanner());
+        sb.append("\n\n");
+        sb.append(Styles.selectLabel.render("  Resume a Session"));
+        sb.append("\n");
+        if (!resumeSearch.isEmpty()) {
+            sb.append(Styles.statusBar.render("  Search: " + resumeSearch + "█"));
+            sb.append("\n");
+        }
+        sb.append("\n");
+
+        if (resumeFiltered.isEmpty()) {
+            sb.append(Styles.statusBar.render("  No sessions found."));
+            sb.append("\n");
+        } else {
+            int start = Math.max(0, resumeCursor - 5);
+            int end = Math.min(resumeFiltered.size(), start + 12);
+            for (int i = start; i < end; i++) {
+                var s = resumeFiltered.get(i);
+                String marker = i == resumeCursor ? " ❯ " : "   ";
+                var style = i == resumeCursor ? Styles.selectedItem : Styles.normalItem;
+                String preview = s.firstMessage().length() > 50
+                        ? s.firstMessage().substring(0, 47) + "..."
+                        : s.firstMessage();
+                String meta = "%s · %d msgs".formatted(s.id(), s.messageCount());
+                sb.append(style.render(marker + preview));
+                sb.append("\n");
+                sb.append(Styles.statusBar.render("     " + meta));
+                sb.append("\n");
+            }
+        }
+
+        sb.append("\n");
+        sb.append(Styles.statusBar.render("  j/k to move · enter to resume · escape to cancel · type to search"));
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Permission dialog
+    // ────────────────────────────────────────────────────────────────────
+
+    private UpdateResult<CodePawModel> handlePermDialogKey(KeyPressMessage kpm) {
+        String key = kpm.key();
+        return switch (key) {
+            case "up", "k" -> { if (permCursor > 0) permCursor--; yield UpdateResult.from(this); }
+            case "down", "j" -> { if (permCursor < 2) permCursor++; yield UpdateResult.from(this); }
+            case "enter" -> {
+                var response = switch (permCursor) {
+                    case 0 -> PermissionResponse.ALLOW;
+                    case 1 -> PermissionResponse.ALLOW_ALWAYS;
+                    default -> PermissionResponse.DENY;
+                };
+                if (pendingPermission != null) pendingPermission.complete(response);
+                permDialog = false;
+                pendingPermission = null;
+                yield UpdateResult.from(this);
+            }
+            case "escape" -> {
+                if (pendingPermission != null) pendingPermission.complete(PermissionResponse.DENY);
+                permDialog = false;
+                pendingPermission = null;
+                yield UpdateResult.from(this);
+            }
+            default -> UpdateResult.from(this);
+        };
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Rewind dialog
+    // ────────────────────────────────────────────────────────────────────
+
+    private UpdateResult<CodePawModel> handleRewindKey(KeyPressMessage kpm) {
+        String key = kpm.key();
+        if (rewindPhase == 0) {
+            return switch (key) {
+                case "escape" -> { rewindDialog = false; yield UpdateResult.from(this); }
+                case "up", "k" -> { if (rewindCursor > 0) rewindCursor--; yield UpdateResult.from(this); }
+                case "down", "j" -> { if (rewindCursor < rewindSnapshots.size() - 1) rewindCursor++; yield UpdateResult.from(this); }
+                case "enter" -> { rewindPhase = 1; rewindOptionCursor = 0; yield UpdateResult.from(this); }
+                default -> UpdateResult.from(this);
+            };
+        }
+        // Phase 1: option selection
+        return switch (key) {
+            case "escape" -> { rewindPhase = 0; yield UpdateResult.from(this); }
+            case "up", "k" -> { if (rewindOptionCursor > 0) rewindOptionCursor--; yield UpdateResult.from(this); }
+            case "down", "j" -> { if (rewindOptionCursor < REWIND_OPTIONS.length - 1) rewindOptionCursor++; yield UpdateResult.from(this); }
+            case "enter" -> executeRewindOption();
+            default -> UpdateResult.from(this);
+        };
+    }
+
+    private UpdateResult<CodePawModel> executeRewindOption() {
+        var snap = rewindSnapshots.get(rewindCursor);
+        switch (rewindOptionCursor) {
+            case 0 -> { // Restore code and conversation
+                var changed = fileHistory.rewind(rewindCursor);
+                conversation.truncateTo(snap.messageIndex());
+                chatMessages.clear();
+                chatMessages.add(new ChatMessage("system",
+                        "⟲ Rewound to checkpoint %d. Restored %d file(s) and conversation.".formatted(
+                                rewindCursor + 1, changed.size())));
+            }
+            case 1 -> { // Restore conversation only
+                conversation.truncateTo(snap.messageIndex());
+                chatMessages.clear();
+                chatMessages.add(new ChatMessage("system",
+                        "⟲ Rewound conversation to checkpoint %d. Files unchanged.".formatted(rewindCursor + 1)));
+            }
+            case 2 -> { // Restore code only
+                var changed = fileHistory.rewind(rewindCursor);
+                chatMessages.add(new ChatMessage("system",
+                        "⟲ Restored %d file(s) to checkpoint %d. Conversation unchanged.".formatted(
+                                changed.size(), rewindCursor + 1)));
+            }
+            case 3 -> { // Never mind
+                rewindDialog = false;
+                rewindPhase = 0;
+                return UpdateResult.from(this);
+            }
+        }
+        rewindDialog = false;
+        rewindPhase = 0;
+        return UpdateResult.from(this);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // AskUser dialog
+    // ────────────────────────────────────────────────────────────────────
+
